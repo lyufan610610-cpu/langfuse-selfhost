@@ -1,125 +1,208 @@
-# langfuse-selfhost
+# Langfuse Self-Host & Automated RAG Evaluation Suite (LLM-as-Judge)
 
-Langfuse v4 单机自托管部署，附带一套针对 Dify 知识库问答的 **LLM-as-Judge 定期审核**脚本。
+[English](README.md) | [中文](README_zh.md)
 
-Dify 应用侧开启 tracing、把 Langfuse 的 `pk-lf-...` / `sk-lf-...` 填进去之后，问答 trace 就会落到这里；
-`review/kb_review.py` 每天定时拉取最近的 trace，用本地大模型判卷，再把分数写回 Langfuse。
+A production-tuned, single-node deployment of **Langfuse v4** observability infrastructure, coupled with a zero-dependency **LLM-as-Judge** automated evaluation pipeline designed specifically for Dify Knowledge Base and enterprise RAG applications.
 
-## 目录结构
+---
+
+## Architecture Overview
+
+Deploying LLM observability in production requires both robust tracing telemetry and automated quality evaluation. This repository provides an end-to-end operational setup:
+1. **Resource-Optimized Langfuse v4 Core**: A 6-container Docker Compose topology optimized for enterprise on-premise deployment, incorporating ClickHouse log-pruning to eliminate disk bloat, network isolation, and automatic workspace assignment.
+2. **Autonomous RAG Quality Review Engine (`review/kb_review.py`)**: A dependency-free LLM-as-Judge pipeline that periodically pulls Dify conversation traces, extracts contextual retrieval evidence, evaluates answer quality across four distinct RAG metrics, and syncs directional scores directly back to Langfuse.
+
+```
++----------------------------------------------------------------------------------------------------+
+|                                    System Architecture & Workflow                                  |
+|                                                                                                    |
+|  +------------------------+                +----------------------------------------------------+  |
+|  | Dify Application (RAG) | -- Traces ---> | Langfuse Self-Hosted Telemetry Stack               |  |
+|  | (Agent / Workflow / KB)|                |                                                    |  |
+|  +------------------------+                |  - langfuse-web (Port 8083)  - langfuse-worker    |  |
+|                                            |  - ClickHouse (Low-Mem)      - PostgreSQL 17      |  |
+|                                            |  - Redis 7.2 (Auth)          - MinIO (S3 Storage) |  |
+|                                            +----------------------------------------------------+  |
+|                                                                      |                             |
+|                                          1. Scheduled Trace Query    v                             |
+|  +----------------------------------------------------------------------------------------------+  |
+|  |                      Automated LLM-as-Judge Evaluation Engine (review/)                      |  |
+|  |                                                                                              |  |
+|  |  +------------------------+  +--------------------------+  +------------------------------+  |  |
+|  |  | Multi-Node Retrieval   |  | Greedy Paragraph-Aware   |  | Multi-Reply Aggregation      |  |  |
+|  |  | Merge & Deduplication  |  | Budget Packing           |  | & Sanitization               |  |  |
+|  |  +------------------------+  +--------------------------+  +------------------------------+  |  |
+|  |                                           |                                                  |  |
+|  |                                           v                                                  |  |
+|  |  +----------------------------------------------------------------------------------------+  |  |
+|  |  | Multi-Dimensional Evaluation Matrix (Accuracy / Faithfulness / Hallucination / Resolved)|  |  |
+|  |  +----------------------------------------------------------------------------------------+  |  |
+|  |                                           |                                                  |  |
+|  |                                           v                                                  |  |
+|  |                  Local Judge Model (e.g. DeepSeek-R1 / Qwen Reasoning Models)                |  |
+|  +----------------------------------------------------------------------------------------------+  |
+|                                              |                                                     |
+|                                              | 2. Backfill Evaluation Scores & Rationales          |
+|                                              v                                                     |
+|                        Langfuse Tracing Analytics & Continuous Dashboards                          |
++----------------------------------------------------------------------------------------------------+
+```
+
+---
+
+## Infrastructure Highlights
+
+### 1. Tailored Docker Compose Topology
+- **`langfuse-web` (Port 8083 -> 3000)**: Serves the Web UI and ingestion API, mapped to a dedicated port to avoid collisions with existing host services.
+- **`langfuse-worker` (Internal 3030)**: Handles asynchronous queue processing, batch exports, and ClickHouse writes.
+- **`postgres:17`**: Stores relational data (users, organizations, projects, API keys, evaluation criteria). Configured without exposed host ports to isolate relational data.
+- **`clickhouse` (`clickhouse/clickhouse-server:24.3-alpine`)**: High-throughput storage for traces and observation records.
+- **`redis:7.2-alpine`**: Task queue layer protected with authentication and health-check verification.
+- **`minio`**: S3-compatible blob storage handling large trace events (`events/`) and multimodal media assets (`media/`).
+
+### 2. ClickHouse Low-Memory Tuning (`clickhouse-lowmem.xml`)
+In default ClickHouse deployments, internal metric and query log tables (`trace_log`, `text_log`, `metric_log`, etc.) generate hundreds of thousands of daily log entries, consuming disk I/O and causing memory creep. 
+Our configuration mounts `clickhouse-lowmem.xml` into `/etc/clickhouse-server/config.d/lowmem.xml`, actively disabling these diagnostic system log tables and maintaining long-term stability on single-node instances.
+
+### 3. SMTP-Free Automatic Workspace Bootstrapping
+Self-hosted enterprise servers often lack an active outbound SMTP gateway. By configuring `LANGFUSE_DEFAULT_ORG_ID` and `LANGFUSE_DEFAULT_PROJECT_ID`, newly registered team members are automatically provisioned into the designated workspace upon account creation without requiring email invitation tokens.
+
+---
+
+## Automated RAG Evaluation Engine (`review/kb_review.py`)
+
+The companion evaluation pipeline is a zero-dependency Python script (requiring only `requests`) that operates as an autonomous **LLM-as-Judge** auditor:
+
+### The 4-Dimensional Metric Evaluation Matrix
+
+| Metric Name | Value Range | Optimization Direction | Semantic Definition |
+|---|---|---|---|
+| **Knowledge Accuracy** | `0.0 ~ 1.0` | Higher is better | Measures whether the assistant's claims factually align with the retrieved knowledge chunks. |
+| **Knowledge Faithfulness** | `0.0 ~ 1.0` | Higher is better | Measures groundedness: evaluates whether the answer is strictly derived from retrieved evidence without ungrounded extrapolation. |
+| **Knowledge Hallucination** | `0 / 1` (Binary) | Lower is better | Flags external factual fabrications not supported by the retrieved context (`1` = Hallucination detected, `0` = Clean). |
+| **Task Resolution** | `0 / 1` (Binary) | Higher is better | Evaluates whether the user's intent was resolved. Crucially distinguishes between helpful answers and correct refusals when context is empty (`resolved=0` on context-absent refusals, even when `accuracy=1.0`). |
+
+### Production Workflow Adaptations
+- **Multi-Node Retrieval Consolidation**: Aggregates, deduplicates, and ranks retrieved snippets across multiple retrieval nodes in complex Dify workflows.
+- **Greedy Paragraph-Aware Packing**: Assembles context snippets up to character budgets (`MAX_CONTEXT_CHARS`) on clean paragraph boundaries, preventing mid-sentence truncation.
+- **Multi-Reply Node Aggregation**: Gathers and concatenates outputs from branched synthesis nodes.
+- **Non-Invasive Directional Comments**: Attaches detailed scoring rationales and metric definitions directly to Langfuse score objects.
+
+---
+
+## Directory Structure
 
 ```
 langfuse-selfhost/
-├── docker-compose.yml        # 6 个容器：web / worker / postgres / clickhouse / redis / minio
-├── clickhouse-lowmem.xml     # 关掉用不上的日志表，省磁盘
-├── .env.example              # 环境变量示例（复制为 .env）
+├── docker-compose.yml        # 6-container production deployment topology
+├── clickhouse-lowmem.xml     # ClickHouse log-suppression configuration
+├── .env.example              # Core infrastructure environment variables template
 └── review/
-    ├── kb_review.py          # 审核脚本，只用 requests，无额外依赖
-    ├── review.env.example    # 审核配置示例（复制为 review.env）
-    └── run-review.sh         # crontab 入口
+    ├── kb_review.py          # Zero-dependency LLM-as-Judge evaluation engine
+    ├── review.env.example    # Evaluator configuration template (Judge model, endpoints)
+    └── run-review.sh         # Crontab wrapper script with self-resolving directory paths
 ```
 
-## 架构
+---
 
-| 容器 | 作用 | 宿主端口 |
-|---|---|---|
-| `langfuse-web` | 网页端 / API | `8083 -> 3000` |
-| `langfuse-worker` | 队列消费、异步评估、写 ClickHouse | 仅 `127.0.0.1:3030` |
-| `postgres` | 用户 / 项目 / API Key / 评分规则等关系型数据 | 不发布 |
-| `clickhouse` | trace / observation 明细 | 仅 `127.0.0.1:8123`、`127.0.0.1:9000` |
-| `redis` | web 与 worker 之间的任务队列 | 仅 `127.0.0.1:6379` |
-| `minio` | trace 大字段（events/）与图片等媒体（media/） | `9090 -> 9000`、仅 `127.0.0.1:9091 -> 9001` |
+## Quickstart & Deployment
 
-相对官方 compose 的主要改动：
-
-1. web 端口由 `3000` 改为 `8083`（避开宿主已占用端口）；
-2. postgres 不发布宿主端口（宿主 5432/5433 已被其它数据库占用）；
-3. ClickHouse 挂载 `clickhouse-lowmem.xml`，关闭 `trace_log` / `text_log` 等日志表；
-4. Redis 开启密码，健康检查带 `-a` 认证；
-5. 增加 `LANGFUSE_DEFAULT_ORG_ID` / `LANGFUSE_DEFAULT_PROJECT_ID`，让新注册用户自动落到既有组织与项目（无 SMTP 时替代邀请邮件）。
-
-## 快速开始
-
+### 1. Deploy Langfuse Infrastructure
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 编辑 .env：至少改掉所有 change-me，并把 NEXTAUTH_URL 改成实际访问地址
 
+# Edit .env with your secrets and host endpoints
+vi .env
+
+# Start all services
 docker compose up -d
 docker compose ps
 ```
 
-浏览器打开 `http://<host>:8083`，用 `.env` 里 `LANGFUSE_INIT_USER_*` 创建的账号登录。
+Access the Web Console at `http://<your-host>:8083` and sign in using the administrative credentials initialized in `.env`.
 
-> `LANGFUSE_INIT_*` 只在**空库第一次启动**时生效。库已初始化后再改没有效果，除非 `docker compose down -v` 重建。
+> **Note**: `LANGFUSE_INIT_*` credentials are processed only during the initial bootstrap of an empty database.
 
-## 关键环境变量
+---
 
-| 变量 | 说明 |
-|---|---|
-| `NEXTAUTH_URL` | 浏览器访问地址 + 登录回调地址 |
-| `NEXTAUTH_SECRET` / `SALT` / `ENCRYPTION_KEY` | 核心密钥，**装好之后不要再改**，否则库里已加密的凭据解不开 |
-| `DATABASE_URL` | PostgreSQL 连接串，账号密码要和 `POSTGRES_*` 一致 |
-| `CLICKHOUSE_PASSWORD` / `REDIS_AUTH` | 中间件密码 |
-| `MINIO_ROOT_*` | MinIO 账号，必须与 `LANGFUSE_S3_*_ACCESS_KEY_ID/SECRET_ACCESS_KEY` 一致 |
-| `LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT` | 浏览器取图片用的 MinIO 地址，必须是浏览器可达的地址 |
-| `LANGFUSE_LLM_CONNECTION_WHITELISTED_IPS` / `_IP_SEGMENTS` | 网页端 LLM 评估器允许连接的内网地址/网段 |
-| `LANGFUSE_INIT_ORG_ID` / `_PROJECT_ID` | 首次启动创建的组织 / 项目标识 |
-| `LANGFUSE_DEFAULT_ORG_ID` / `_PROJECT_ID` | 新用户自助注册后自动加入的组织 / 项目 |
+### 2. Connect Dify Tracing
+In your Dify application console:
+1. Navigate to **Monitoring / Tracing**.
+2. Select **Langfuse** as the provider.
+3. Configure:
+   - **Host**: `http://<langfuse-host>:8083`
+   - **Public Key**: `<LANGFUSE_INIT_PROJECT_PUBLIC_KEY>`
+   - **Secret Key**: `<LANGFUSE_INIT_PROJECT_SECRET_KEY>`
 
-改完 `.env` 必须 `docker compose down && docker compose up -d`；只 `restart` 不会重新读取 `.env`。
+Your Dify conversation traces will now stream directly into the self-hosted Langfuse stack.
 
-## Dify 侧接入
+---
 
-在 Dify 应用的「监控 / Tracing」里选择 Langfuse，填入：
-
-- Host：`http://<langfuse-host>:8083`
-- Public Key / Secret Key：`.env` 中 `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `SECRET_KEY` 的值（或网页端项目设置里新建的 Key）
-
-## 问答质量定期审核
-
-`review/kb_review.py` 做的事：
-
-1. 从 Langfuse 拉取最近 `LOOKBACK_HOURS` 小时内、发生过知识检索的 trace；
-2. 取「用户问题 + 检索片段 + 助手最终回答」；
-3. 交给 OpenAI 兼容接口的判卷模型打分；
-4. 把 4 个分数写回对应 trace。
-
-| 分数 | 含义 | 方向 |
-|---|---|---|
-| `知识库准确率` | 回答是否符合检索片段 | 0~1，越高越好 |
-| `知识库忠实度` | 是否只依据片段作答 | 0~1，越高越好 |
-| `知识库编造` | 是否存在片段外编造 | 0/1，越低越好 |
-| `问题已解决` | 用户问题是否被真正答掉 | 0/1，越高越好 |
-
-准备配置并试跑：
+### 3. Configure & Run the Evaluation Engine
 
 ```bash
 cd review
 cp review.env.example review.env
 chmod 600 review.env
-# 编辑 review.env：填 Langfuse Key、判卷模型的地址与模型名
 
-python3 kb_review.py --dry-run --force   # 只打印，不回写
-python3 kb_review.py                     # 正式回写
+# Configure your Judge model API (OpenAI-compatible endpoint, e.g. local vLLM / Ollama)
+vi review.env
+
+# Dry-run test (prints evaluation scores to stdout without writing back)
+python3 kb_review.py --dry-run --force
+
+# Live execution (commits evaluation scores back to Langfuse traces)
+python3 kb_review.py
 ```
 
-定时执行（每天 07:30）：
+### 4. Schedule Unattended Daily Audits
+Set up a crontab entry (e.g. daily audit at 07:30 AM):
 
 ```cron
 30 7 * * * bash /path/to/langfuse-selfhost/review/run-review.sh
 ```
 
-`run-review.sh` 以脚本自身所在目录为工作目录，不依赖固定绝对路径；日志追加到 `review/logs/cron.log`。
+Logs are automatically appended to `review/logs/cron.log`.
 
-节点名与工作流不一致时不用改脚本，直接在 `review.env` 里追加 `RETRIEVAL_NAME_HINTS` / `ANSWER_NAME_HINTS` 关键词。
+---
 
-## 运维提示
+## Configuration Reference
 
-- 数据都在命名卷里（`langfuse_postgres_data`、`langfuse_clickhouse_data`、`langfuse_minio_data` 等），备份请直接备份卷或用官方导出；
-- 单机内存占用参考：postgres 2G、clickhouse 8G、worker 4G、web 4G、redis 1G、minio 1G（compose 中已设 `mem_limit`，可按机器调整）；
-- 内网部署建议关闭遥测：`TELEMETRY_ENABLED=false`。
+### Infrastructure Environment (`.env`)
 
-## 安全说明
+| Variable | Description |
+|---|---|
+| `NEXTAUTH_URL` | Web console access URL and OAuth callback base (e.g. `http://192.168.1.100:8083`). |
+| `NEXTAUTH_SECRET` / `SALT` / `ENCRYPTION_KEY` | Core encryption keys. **Do not modify after deployment** to prevent key mismatch on stored secrets. |
+| `DATABASE_URL` | PostgreSQL connection string matching `POSTGRES_*` settings. |
+| `CLICKHOUSE_PASSWORD` | ClickHouse authentication password. |
+| `REDIS_AUTH` | Redis authentication password. |
+| `LANGFUSE_DEFAULT_ORG_ID` / `_PROJECT_ID` | Default workspace for new user auto-onboarding without SMTP invitations. |
+| `TELEMETRY_ENABLED` | Set to `false` for air-gapped on-premise environments. |
 
-本仓库只包含**模板**：`.env.example` / `review.env.example` 里全部为占位符。
-真实密钥、账号、内网 IP、组织与项目标识均未入库，`.env`、`review/review.env`、`review/logs/`、`backup/` 已被 `.gitignore` 排除。
+### Evaluator Environment (`review/review.env`)
+
+| Variable | Default Value | Description |
+|---|---|---|
+| `LANGFUSE_HOST` | `http://127.0.0.1:8083` | Langfuse API address. |
+| `JUDGE_BASE_URL` | `http://127.0.0.1:8001/v1` | OpenAI-compatible endpoint for the Judge model (vLLM, Ollama, SGLang). |
+| `JUDGE_MODEL` | `deepseek-r1-14b-awq` | Judge model identifier. |
+| `LOOKBACK_HOURS` | `24` | Time window for querying recent conversation traces. |
+| `MAX_TRACES` | `30` | Maximum number of traces to audit per evaluation run. |
+| `REQUIRE_RETRIEVAL` | `true` | Filter to audit only traces that executed knowledge retrieval steps. |
+| `SCORE_NAME_ACCURACY` | `""` | Custom score identifier (defaults to localized or standard name). |
+| `RETRIEVAL_NAME_HINTS` | `知识检索,retriev,knowledge,检索` | Comma-separated workflow node name substrings used to detect retrieval steps. |
+| `ANSWER_NAME_HINTS` | `直接回复,answer,回复` | Comma-separated workflow node name substrings used to detect answer steps. |
+
+---
+
+## Production Operations & Maintenance
+
+- **Persistent Volumes**: All critical data resides in Docker named volumes (`langfuse_postgres_data`, `langfuse_clickhouse_data`, `langfuse_minio_data`). For backups, snapshot these volumes directly or use standard database dump utilities.
+- **Memory Allocation**: Typical resource usage:
+  - Postgres: ~2 GB
+  - ClickHouse: ~4–8 GB (with log suppression active)
+  - Worker & Web: ~2–4 GB each
+  - Redis & MinIO: ~1 GB each
+- **Air-Gapped Isolation**: Set `TELEMETRY_ENABLED=false` to ensure zero external outbound calls.
