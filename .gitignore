@@ -1,0 +1,8 @@
+.env
+review/review.env
+review/logs/
+backup/
+*.log
+__pycache__/
+*.pyc
+.DS_Store

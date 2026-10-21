@@ -1,0 +1,228 @@
+# ============================================================
+# Langfuse v4 自托管（6 个容器）
+# 目录：部署目录（与 .env 同级）
+# 基准：官方 github.com/langfuse/langfuse/docker-compose.yml
+# 相对官方改了几处，都是为单机部署改的，下面就近标注 [改动N]。
+# 配套文件：.env（密钥与地址）、clickhouse-lowmem.xml（省日志）
+# ============================================================
+name: langfuse
+
+# 六个服务共用的环境变量（web 和 worker 都用这一套）
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: ${NEXTAUTH_URL}
+  DATABASE_URL: ${DATABASE_URL}
+  SALT: ${SALT}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+  TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+  LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-dual}
+  LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+  # 网页端 LLM 评估器允许连的地址。不配的话它会拒绝连内网模型服务。
+  LANGFUSE_LLM_CONNECTION_WHITELISTED_HOST: ${LANGFUSE_LLM_CONNECTION_WHITELISTED_HOST:-}
+  LANGFUSE_LLM_CONNECTION_WHITELISTED_IPS: ${LANGFUSE_LLM_CONNECTION_WHITELISTED_IPS:-}
+  LANGFUSE_LLM_CONNECTION_WHITELISTED_IP_SEGMENTS: ${LANGFUSE_LLM_CONNECTION_WHITELISTED_IP_SEGMENTS:-}
+  # ClickHouse（trace 明细存这里）
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  # Redis（异步任务队列）
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH}
+  REDIS_TLS_ENABLED: "false"
+  # MinIO / S3：trace 的大字段写 events/，图片等媒体写 media/
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY}
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT}
+  LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY}
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+  # 本机没有邮件服务，留空即可
+  EMAIL_FROM_ADDRESS: ""
+  SMTP_CONNECTION_URL: ""
+  # 新用户注册后自动加入下面这个组织/项目。本机没配邮件服务，邀请邮件发不出去，
+  # 用这个替代「邀请」：同事自己注册，立刻就落在同一个组织 / 项目里。
+  LANGFUSE_DEFAULT_ORG_ID: ${LANGFUSE_DEFAULT_ORG_ID:-}
+  LANGFUSE_DEFAULT_ORG_ROLE: ${LANGFUSE_DEFAULT_ORG_ROLE:-VIEWER}
+  LANGFUSE_DEFAULT_PROJECT_ID: ${LANGFUSE_DEFAULT_PROJECT_ID:-}
+  LANGFUSE_DEFAULT_PROJECT_ROLE: ${LANGFUSE_DEFAULT_PROJECT_ROLE:-VIEWER}
+
+services:
+  # ------------------------------------------------------------
+  # 数据库：PostgreSQL（存用户、项目、API Key、评分规则等关系型数据）
+  # ------------------------------------------------------------
+  postgres:
+    image: postgres:17
+    container_name: langfuse-postgres
+    restart: unless-stopped
+    mem_limit: 2g
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    # [改动3] 官方模板把 5432 发布到宿主 127.0.0.1，本机 5432/5433 已被
+    #          其它 postgres 容器占用，所以这里干脆不发布端口。
+    #          langfuse 的 web/worker 走内部网络访问它，不需要宿主端口。
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # ------------------------------------------------------------
+  # 数据库：ClickHouse（存 trace / observation 明细，写入量大）
+  # ------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    container_name: langfuse-clickhouse
+    restart: unless-stopped
+    mem_limit: 8g
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+      # [改动4] 挂上你自己放的那份配置，关掉一堆用不上的日志表，省磁盘
+      - ./clickhouse-lowmem.xml:/etc/clickhouse-server/config.d/zz-lowmem.xml:ro
+    ports:
+      - 127.0.0.1:8123:8123
+      - 127.0.0.1:9000:9000
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # ------------------------------------------------------------
+  # 消息队列：Redis（web 收数据后丢队列，worker 慢慢写库）
+  # ------------------------------------------------------------
+  redis:
+    image: redis:7
+    container_name: langfuse-redis
+    restart: unless-stopped
+    mem_limit: 1g
+    command: >
+      --requirepass ${REDIS_AUTH}
+      --maxmemory-policy noeviction
+    environment:
+      REDIS_PASSWORD: ${REDIS_AUTH}
+    volumes:
+      - langfuse_redis_data:/data
+    ports:
+      - 127.0.0.1:6379:6379
+    healthcheck:
+      # 官方模板用的是不带密码的 `redis-cli ping`，这里加了鉴权，实测更稳
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  # ------------------------------------------------------------
+  # 对象存储：MinIO（存 trace 的大字段和上传的图片）
+  # ------------------------------------------------------------
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    container_name: langfuse-minio
+    restart: unless-stopped
+    mem_limit: 1g
+    entrypoint: sh
+    # 启动前先建好 langfuse 这个 bucket
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - langfuse_minio_data:/data
+    ports:
+      - 9090:9000
+      - 127.0.0.1:9091:9001
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  # ------------------------------------------------------------
+  # 后台进程：跑队列、异步评估、写 ClickHouse
+  # ------------------------------------------------------------
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4
+    container_name: langfuse-worker
+    restart: unless-stopped
+    mem_limit: 4g
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *langfuse-env
+      NODE_OPTIONS: --max-old-space-size=2048
+    ports:
+      - 127.0.0.1:3030:3030
+
+  # ------------------------------------------------------------
+  # 网页端：就是你浏览器要打开的那个地址
+  # ------------------------------------------------------------
+  langfuse-web:
+    image: langfuse/langfuse:4
+    container_name: langfuse-web
+    restart: unless-stopped
+    mem_limit: 4g
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      # [改动2] 官方是 3000:3000，本机 3000 已被占用，换成 8083
+      - 8083:3000
+    environment:
+      <<: *langfuse-env
+      NODE_OPTIONS: --max-old-space-size=2048
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      # 下面这些只在「空库第一次启动」时生效，用来建组织/项目/账号
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:
